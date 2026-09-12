@@ -146,9 +146,10 @@ func main() {
 		port = "8080"
 	}
 
-	// Read deletion timeout from environment variable, default to 2 minutes
+	// How long an uploaded file stays reachable. Two hours gives a reader time
+	// to open what was shared while a conversation is still going.
 	deleteTimeoutStr := os.Getenv("DELETE_TIMEOUT_MINUTES")
-	deleteTimeoutMinutes := 2
+	deleteTimeoutMinutes := 120
 	if deleteTimeoutStr != "" {
 		if parsed, err := strconv.Atoi(deleteTimeoutStr); err == nil {
 			deleteTimeoutMinutes = parsed
