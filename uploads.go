@@ -22,11 +22,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Reasonable default extension list -- can be overridden via the
@@ -283,4 +285,60 @@ func ensureUploadsDir() {
 // uploadsPath joins the uploads directory with a filename.
 func uploadsPath(name string) string {
 	return filepath.Join(uploadsDir, name)
+}
+
+// sweepInterval is how often expired uploads are looked for. Frequent enough
+// that a file outlives its retention by minutes rather than hours, cheap
+// enough that it is a directory listing and nothing more.
+const sweepInterval = 10 * time.Minute
+
+// sweepExpiredUploads deletes files in the uploads directory last modified
+// longer ago than retention, and reports how many went. Subdirectories are
+// left alone, which is what keeps uploads/emoji/ (deliberately permanent)
+// out of it.
+//
+// The per-upload timer only lives as long as the process, so without this a
+// restart would strand every pending file on disk forever.
+func sweepExpiredUploads(dir string, retention time.Duration, now time.Time) (int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if now.Sub(info.ModTime()) < retention {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, entry.Name())); err == nil {
+			removed++
+		}
+	}
+	return removed, nil
+}
+
+// startUploadSweeper runs a sweep now and then on every tick, so retention is
+// enforced across restarts rather than only while the process that took the
+// upload is still alive.
+func startUploadSweeper(retention time.Duration) {
+	if removed, err := sweepExpiredUploads(uploadsDir, retention, time.Now()); err != nil {
+		log.Printf("upload sweep failed: %v", err)
+	} else if removed > 0 {
+		log.Printf("upload sweep removed %d expired file(s) at startup", removed)
+	}
+	go func() {
+		for range time.Tick(sweepInterval) {
+			if removed, err := sweepExpiredUploads(uploadsDir, retention, time.Now()); err != nil {
+				log.Printf("upload sweep failed: %v", err)
+			} else if removed > 0 {
+				log.Printf("upload sweep removed %d expired file(s)", removed)
+			}
+		}
+	}()
 }

@@ -171,6 +171,7 @@ func main() {
 	// Multimedia config: allowed extensions, ClamAV scanning, etc.
 	mediaCfg := loadMediaConfig(maxUploadSize)
 	ensureUploadsDir()
+	startUploadSweeper(deleteTimeout)
 
 	// Read image processing configuration
 	imageCompressionEnabled := os.Getenv("IMAGE_COMPRESSION_ENABLED") == "true"
