@@ -915,10 +915,7 @@ func (m *voiceManager) handleLeave(nick, channel string) {
 	for _, other := range room.peers {
 		other.mu.Lock()
 		for key, sender := range other.subSenders {
-			// subSenders are keyed by the unique localID
-			// "<nick>-<kind>-<remoteTrackID>" -- delete every entry
-			// whose nick segment matches the departing peer.
-			if strings.HasPrefix(key, nick+"-") {
+			if track := sender.Track(); track != nil && track.StreamID() == nick {
 				_ = other.pc.RemoveTrack(sender)
 				delete(other.subSenders, key)
 			}
@@ -1134,22 +1131,12 @@ func (p *voicePeer) trackHints() []TrackHint {
 		if track == nil {
 			continue
 		}
-		// localID format: "<nick>-<kind>-<asciiSuffix>".
-		id := track.ID()
-		first := strings.IndexByte(id, '-')
-		if first < 0 {
-			continue
-		}
-		rest := id[first+1:]
-		second := strings.IndexByte(rest, '-')
-		if second < 0 {
-			continue
-		}
+		// Every fanned-out track carries its publisher's nick as the stream ID.
 		out = append(out, TrackHint{
-			TrackID: id,
+			TrackID: track.ID(),
 			Mid:     t.Mid(),
-			Member:  id[:first],
-			Kind:    rest[:second],
+			Member:  track.StreamID(),
+			Kind:    track.Kind().String(),
 		})
 	}
 	return out
