@@ -65,8 +65,11 @@ func InitWebPush() error {
 	switch {
 	case err == nil:
 		var k vapidKeyfile
-		if err := json.Unmarshal(data, &k); err != nil || k.Private == "" || k.Public == "" {
-			return fmt.Errorf("unreadable VAPID keyfile %s, fix or remove it: %v", path, err)
+		if err := json.Unmarshal(data, &k); err != nil {
+			return fmt.Errorf("unreadable VAPID keyfile %s, fix or remove it: %w", path, err)
+		}
+		if k.Private == "" || k.Public == "" {
+			return fmt.Errorf("VAPID keyfile %s is missing a key, fix or remove it", path)
 		}
 		vapidPrivateKey, vapidPublicKey = k.Private, k.Public
 	case errors.Is(err, fs.ErrNotExist):
@@ -76,11 +79,9 @@ func InitWebPush() error {
 		}
 		vapidPrivateKey, vapidPublicKey = priv, pub
 		if err := writeVAPIDKeyfile(path, vapidKeyfile{Private: priv, Public: pub}); err != nil {
-			log.Printf("webpush: WARNING could not persist VAPID keys to %s: %v", path, err)
-			log.Printf("webpush: keys are in-memory only; a restart will invalidate all subscriptions")
-		} else {
-			log.Printf("webpush: generated new VAPID keypair -> %s", path)
+			return fmt.Errorf("persist VAPID keyfile %s: %w", path, err)
 		}
+		log.Printf("webpush: generated new VAPID keypair -> %s", path)
 	default:
 		return err
 	}
@@ -95,8 +96,7 @@ func InitWebPush() error {
 	return nil
 }
 
-// We write through a rename so a crash mid-write leaves the old file or none,
-// since a truncated keyfile would otherwise cost every subscription.
+// We write through a synced rename so a crash leaves a whole keyfile or none, since InitWebPush refuses to start on a truncated one.
 func writeVAPIDKeyfile(path string, k vapidKeyfile) error {
 	b, err := json.MarshalIndent(k, "", "  ")
 	if err != nil {
@@ -106,7 +106,19 @@ func writeVAPIDKeyfile(path string, k vapidKeyfile) error {
 		return err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
@@ -182,8 +194,7 @@ func handlePushSend(w http.ResponseWriter, r *http.Request) {
 		VAPIDPublicKey:  vapidPublicKey,
 		VAPIDPrivateKey: vapidPrivateKey,
 		TTL:             ttl,
-		// Push services hold back normal-urgency pushes while a phone dozes,
-		// and a chat message is only worth a notification while it is fresh.
+		// We ask for high urgency because push services hold back normal pushes while a phone dozes.
 		Urgency:    webpush.UrgencyHigh,
 		HTTPClient: pushHTTPClient,
 	})
@@ -236,10 +247,24 @@ func refuseInternalAddress(_, address string, _ syscall.RawConn) error {
 	return nil
 }
 
-var sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
+var nonPublicPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("2002::/16"),
+}
 
 func isPublicIP(ip netip.Addr) bool {
-	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !sharedAddressSpace.Contains(ip)
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		return false
+	}
+	for _, prefix := range nonPublicPrefixes {
+		if prefix.Contains(ip) {
+			return false
+		}
+	}
+	return true
 }
 
 func isPushEndpointURL(raw string) bool {

@@ -34,6 +34,8 @@ func TestPushRefusesInternalAddresses(t *testing.T) {
 	for _, address := range []string{
 		"127.0.0.1:443", "[::1]:443", "10.1.2.3:443", "172.22.0.4:443",
 		"192.168.1.10:443", "169.254.169.254:80", "100.64.0.1:443", "0.0.0.0:443",
+		"[::ffff:127.0.0.1]:443", "[::ffff:10.0.0.1]:443", "240.0.0.1:443", "198.18.0.1:443",
+		"[64:ff9b::a00:1]:443", "[2002:a00:1::1]:443",
 	} {
 		if refuseInternalAddress("tcp", address, nil) == nil {
 			t.Errorf("allowed %s", address)
@@ -79,6 +81,29 @@ func TestInitWebPushPersistsANewKey(t *testing.T) {
 	}
 	if vapidPublicKey != first {
 		t.Error("generated a second key instead of loading the saved one")
+	}
+}
+
+func TestInitWebPushFailsWhenTheKeyCannotBeSaved(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("VAPID_KEY_FILE", filepath.Join(blocker, "vapid.json"))
+	if err := InitWebPush(); err == nil {
+		t.Fatal("started without saving the key")
+	}
+}
+
+func TestInitWebPushRefusesAKeyfileMissingAKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vapid.json")
+	if err := os.WriteFile(path, []byte(`{"private":"a"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("VAPID_KEY_FILE", path)
+	err := InitWebPush()
+	if err == nil || strings.Contains(err.Error(), "<nil>") {
+		t.Fatalf("got %v, want a missing key error", err)
 	}
 }
 
