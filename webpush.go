@@ -18,9 +18,12 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -58,28 +61,28 @@ func vapidKeyPath() string {
 // existing subscription.
 func InitWebPush() error {
 	path := vapidKeyPath()
-	if data, err := os.ReadFile(path); err == nil {
+	data, err := os.ReadFile(path)
+	switch {
+	case err == nil:
 		var k vapidKeyfile
-		if json.Unmarshal(data, &k) == nil && k.Private != "" && k.Public != "" {
-			vapidPrivateKey = k.Private
-			vapidPublicKey = k.Public
+		if err := json.Unmarshal(data, &k); err != nil || k.Private == "" || k.Public == "" {
+			return fmt.Errorf("unreadable VAPID keyfile %s, fix or remove it: %v", path, err)
 		}
-	}
-
-	if vapidPrivateKey == "" || vapidPublicKey == "" {
+		vapidPrivateKey, vapidPublicKey = k.Private, k.Public
+	case errors.Is(err, fs.ErrNotExist):
 		priv, pub, err := webpush.GenerateVAPIDKeys()
 		if err != nil {
 			return err
 		}
 		vapidPrivateKey, vapidPublicKey = priv, pub
-		b, _ := json.MarshalIndent(vapidKeyfile{Private: priv, Public: pub}, "", "  ")
-		_ = os.MkdirAll(filepath.Dir(path), 0o700)
-		if err := os.WriteFile(path, b, 0o600); err != nil {
+		if err := writeVAPIDKeyfile(path, vapidKeyfile{Private: priv, Public: pub}); err != nil {
 			log.Printf("webpush: WARNING could not persist VAPID keys to %s: %v", path, err)
 			log.Printf("webpush: keys are in-memory only; a restart will invalidate all subscriptions")
 		} else {
 			log.Printf("webpush: generated new VAPID keypair -> %s", path)
 		}
+	default:
+		return err
 	}
 
 	// VAPID 'sub' claim: a mailto: or https URL identifying the sender,
@@ -90,6 +93,23 @@ func InitWebPush() error {
 	}
 	log.Printf("webpush: ready (VAPID public key %s…)", truncForLog(vapidPublicKey, 12))
 	return nil
+}
+
+// We write through a rename so a crash mid-write leaves the old file or none,
+// since a truncated keyfile would otherwise cost every subscription.
+func writeVAPIDKeyfile(path string, k vapidKeyfile) error {
+	b, err := json.MarshalIndent(k, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func truncForLog(s string, n int) string {
@@ -183,9 +203,8 @@ func handlePushSend(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]int{"status": resp.StatusCode})
 }
 
-// Any logged-in IRC user can register an endpoint, so we only ever POST to
-// public HTTPS hosts, checked on the address we actually connect to so a
-// DNS answer cannot point us at an internal service.
+// Any logged-in IRC user can register an endpoint, so we POST only to public
+// HTTPS hosts and check the address we actually dial.
 var pushHTTPClient = &http.Client{
 	Timeout: 15 * time.Second,
 	Transport: &http.Transport{
@@ -207,19 +226,17 @@ func refuseInternalAddress(_, address string, _ syscall.RawConn) error {
 	if err != nil {
 		return err
 	}
-	if ip := net.ParseIP(host); ip == nil || !isPublicIP(ip) {
+	ip, err := netip.ParseAddr(host)
+	if err != nil || !isPublicIP(ip.Unmap()) {
 		return errInternalAddress
 	}
 	return nil
 }
 
-var sharedAddressSpace = &net.IPNet{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)}
+var sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
 
-func isPublicIP(ip net.IP) bool {
-	return !(ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
-		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() ||
-		sharedAddressSpace.Contains(ip))
+func isPublicIP(ip netip.Addr) bool {
+	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !sharedAddressSpace.Contains(ip)
 }
 
 func isPushEndpointURL(raw string) bool {
@@ -227,9 +244,8 @@ func isPushEndpointURL(raw string) bool {
 	return err == nil && u.Scheme == "https" && u.Hostname() != "" && u.User == nil
 }
 
-// We report an endpoint that will never work as a 410 from the push service,
-// inside a 200 because obbyircd only reads the body of a 200, so it drops the
-// subscription.
+// We report a refused endpoint as a 410 inside a 200, since obbyircd reads
+// only the body of a 200 and drops the subscription on a 410.
 func replyEndpointGone(w http.ResponseWriter, reason string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
