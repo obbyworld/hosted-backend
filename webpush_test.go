@@ -1,6 +1,10 @@
 package main
 
 import (
+	"crypto/ecdh"
+	"crypto/rand"
+	"encoding/base64"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -75,5 +79,40 @@ func TestInitWebPushPersistsANewKey(t *testing.T) {
 	}
 	if vapidPublicKey != first {
 		t.Error("generated a second key instead of loading the saved one")
+	}
+}
+
+type recordingTransport struct{ request *http.Request }
+
+func (r *recordingTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	r.request = request
+	return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(""))}, nil
+}
+
+func TestPushSendAsksForHighUrgency(t *testing.T) {
+	t.Setenv("VAPID_KEY_FILE", filepath.Join(t.TempDir(), "vapid.json"))
+	if err := InitWebPush(); err != nil {
+		t.Fatal(err)
+	}
+	transport := &recordingTransport{}
+	saved := pushHTTPClient
+	pushHTTPClient = &http.Client{Transport: transport}
+	t.Cleanup(func() { pushHTTPClient = saved })
+
+	key, err := ecdh.P256().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encode := base64.RawURLEncoding.EncodeToString
+	body := `{"endpoint":"https://fcm.googleapis.com/fcm/send/abc","p256dh":"` +
+		encode(key.PublicKey().Bytes()) + `","auth":"` + encode(make([]byte, 16)) + `","payload":"x"}`
+	recorder := httptest.NewRecorder()
+	handlePushSend(recorder, httptest.NewRequest(http.MethodPost, "/push/send", strings.NewReader(body)))
+
+	if transport.request == nil {
+		t.Fatalf("sent nothing, answered %s", recorder.Body.String())
+	}
+	if urgency := transport.request.Header.Get("Urgency"); urgency != "high" {
+		t.Errorf("Urgency %q, want high", urgency)
 	}
 }

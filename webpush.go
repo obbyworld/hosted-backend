@@ -182,7 +182,10 @@ func handlePushSend(w http.ResponseWriter, r *http.Request) {
 		VAPIDPublicKey:  vapidPublicKey,
 		VAPIDPrivateKey: vapidPrivateKey,
 		TTL:             ttl,
-		HTTPClient:      pushHTTPClient,
+		// Push services hold back normal-urgency pushes while a phone dozes,
+		// and a chat message is only worth a notification while it is fresh.
+		Urgency:    webpush.UrgencyHigh,
+		HTTPClient: pushHTTPClient,
 	})
 	if err != nil {
 		log.Printf("webpush: send error to %s: %v", truncForLog(req.Endpoint, 48), err)
