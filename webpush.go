@@ -61,16 +61,12 @@ func vapidKeyPath() string {
 // existing subscription.
 func InitWebPush() error {
 	path := vapidKeyPath()
-	data, err := os.ReadFile(path)
+	k, err := readVAPIDKeyfile(path)
+	if errors.Is(err, fs.ErrNotExist) && os.Getenv("VAPID_KEY_FILE") == "" {
+		k, err = adoptLegacyVAPIDKeyfile(path)
+	}
 	switch {
 	case err == nil:
-		var k vapidKeyfile
-		if err := json.Unmarshal(data, &k); err != nil {
-			return fmt.Errorf("unreadable VAPID keyfile %s, fix or remove it: %w", path, err)
-		}
-		if k.Private == "" || k.Public == "" {
-			return fmt.Errorf("VAPID keyfile %s is missing a key, fix or remove it", path)
-		}
 		vapidPrivateKey, vapidPublicKey = k.Private, k.Public
 	case errors.Is(err, fs.ErrNotExist):
 		priv, pub, err := webpush.GenerateVAPIDKeys()
@@ -96,20 +92,49 @@ func InitWebPush() error {
 	return nil
 }
 
+func readVAPIDKeyfile(path string) (vapidKeyfile, error) {
+	var k vapidKeyfile
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return k, err
+	}
+	if err := json.Unmarshal(data, &k); err != nil {
+		return k, fmt.Errorf("unreadable VAPID keyfile %s, fix or remove it: %w", path, err)
+	}
+	if k.Private == "" || k.Public == "" {
+		return k, fmt.Errorf("VAPID keyfile %s is missing a key, fix or remove it", path)
+	}
+	return k, nil
+}
+
+// Earlier releases kept the key in the working directory, so we move it into data/ to keep existing subscriptions valid.
+func adoptLegacyVAPIDKeyfile(path string) (vapidKeyfile, error) {
+	k, err := readVAPIDKeyfile("vapid.json")
+	if err != nil {
+		return k, err
+	}
+	if err := writeVAPIDKeyfile(path, k); err != nil {
+		return k, fmt.Errorf("move legacy VAPID keyfile to %s: %w", path, err)
+	}
+	log.Printf("webpush: moved legacy VAPID keypair vapid.json -> %s", path)
+	return k, nil
+}
+
 // We write through a synced rename so a crash leaves a whole keyfile or none, since InitWebPush refuses to start on a truncated one.
 func writeVAPIDKeyfile(path string, k vapidKeyfile) error {
 	b, err := json.MarshalIndent(k, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
 	if err != nil {
 		return err
 	}
+	defer os.Remove(f.Name())
 	if _, err := f.Write(b); err != nil {
 		f.Close()
 		return err
@@ -121,7 +146,18 @@ func writeVAPIDKeyfile(path string, k vapidKeyfile) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(f.Name(), path); err != nil {
+		return err
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		d.Close()
+		return err
+	}
+	return d.Close()
 }
 
 func truncForLog(s string, n int) string {
@@ -252,6 +288,7 @@ var nonPublicPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("240.0.0.0/4"),
 	netip.MustParsePrefix("198.18.0.0/15"),
 	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
 	netip.MustParsePrefix("2002::/16"),
 }
 

@@ -35,7 +35,7 @@ func TestPushRefusesInternalAddresses(t *testing.T) {
 		"127.0.0.1:443", "[::1]:443", "10.1.2.3:443", "172.22.0.4:443",
 		"192.168.1.10:443", "169.254.169.254:80", "100.64.0.1:443", "0.0.0.0:443",
 		"[::ffff:127.0.0.1]:443", "[::ffff:10.0.0.1]:443", "240.0.0.1:443", "198.18.0.1:443",
-		"[64:ff9b::a00:1]:443", "[2002:a00:1::1]:443",
+		"[64:ff9b::a00:1]:443", "[64:ff9b:1::a00:1]:443", "[2002:a00:1::1]:443",
 	} {
 		if refuseInternalAddress("tcp", address, nil) == nil {
 			t.Errorf("allowed %s", address)
@@ -81,6 +81,24 @@ func TestInitWebPushPersistsANewKey(t *testing.T) {
 	}
 	if vapidPublicKey != first {
 		t.Error("generated a second key instead of loading the saved one")
+	}
+}
+
+func TestInitWebPushMovesTheLegacyKeyIntoData(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("VAPID_KEY_FILE", "")
+	legacy := `{"private":"priv","public":"pub"}`
+	if err := os.WriteFile("vapid.json", []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := InitWebPush(); err != nil {
+		t.Fatal(err)
+	}
+	if vapidPrivateKey != "priv" || vapidPublicKey != "pub" {
+		t.Errorf("loaded %q/%q, want the legacy key", vapidPrivateKey, vapidPublicKey)
+	}
+	if k, err := readVAPIDKeyfile(filepath.Join("data", "vapid.json")); err != nil || k.Public != "pub" {
+		t.Errorf("data/vapid.json holds %+v (%v), want the legacy key", k, err)
 	}
 }
 
