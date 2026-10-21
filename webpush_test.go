@@ -132,7 +132,10 @@ func (r *recordingTransport) RoundTrip(request *http.Request) (*http.Response, e
 	return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(""))}, nil
 }
 
-func TestPushSendAsksForHighUrgency(t *testing.T) {
+// sendRecordedPush sends one push with extra JSON fields and returns the
+// request that reached the push service.
+func sendRecordedPush(t *testing.T, extraJSON string) *http.Request {
+	t.Helper()
 	t.Setenv("VAPID_KEY_FILE", filepath.Join(t.TempDir(), "vapid.json"))
 	if err := InitWebPush(); err != nil {
 		t.Fatal(err)
@@ -148,14 +151,34 @@ func TestPushSendAsksForHighUrgency(t *testing.T) {
 	}
 	encode := base64.RawURLEncoding.EncodeToString
 	body := `{"endpoint":"https://fcm.googleapis.com/fcm/send/abc","p256dh":"` +
-		encode(key.PublicKey().Bytes()) + `","auth":"` + encode(make([]byte, 16)) + `","payload":"x"}`
+		encode(key.PublicKey().Bytes()) + `","auth":"` + encode(make([]byte, 16)) +
+		`","payload":"x"` + extraJSON + `}`
 	recorder := httptest.NewRecorder()
 	handlePushSend(recorder, httptest.NewRequest(http.MethodPost, "/push/send", strings.NewReader(body)))
-
 	if transport.request == nil {
 		t.Fatalf("sent nothing, answered %s", recorder.Body.String())
 	}
-	if urgency := transport.request.Header.Get("Urgency"); urgency != "high" {
+	return transport.request
+}
+
+func TestPushSendAsksForHighUrgency(t *testing.T) {
+	if urgency := sendRecordedPush(t, "").Header.Get("Urgency"); urgency != "high" {
 		t.Errorf("Urgency %q, want high", urgency)
+	}
+}
+
+func TestPushSendCollapsesByTopic(t *testing.T) {
+	request := sendRecordedPush(t, `,"topic":"0123456789abcdef"`)
+	if topic := request.Header.Get("Topic"); topic != "0123456789abcdef" {
+		t.Errorf("Topic %q, want 0123456789abcdef", topic)
+	}
+}
+
+func TestPushSendRejectsAMalformedTopic(t *testing.T) {
+	body := `{"endpoint":"https://fcm.googleapis.com/fcm/send/abc","p256dh":"a","auth":"b","payload":"x","topic":"has spaces"}`
+	recorder := httptest.NewRecorder()
+	handlePushSend(recorder, httptest.NewRequest(http.MethodPost, "/push/send", strings.NewReader(body)))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400", recorder.Code)
 	}
 }

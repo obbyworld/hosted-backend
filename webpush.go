@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"syscall"
 	"time"
 
@@ -188,7 +189,11 @@ type pushSendRequest struct {
 	Auth     string `json:"auth"`
 	Payload  string `json:"payload"`
 	TTL      int    `json:"ttl"`
+	// The push service keeps only the newest undelivered push per topic (RFC 8030 section 5.4).
+	Topic string `json:"topic"`
 }
+
+var pushTopicPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
 
 // handlePushSend encrypts `payload` for the given subscription and
 // delivers it to the push service.  Guarded by ServerAuthMiddleware
@@ -211,6 +216,10 @@ func handlePushSend(w http.ResponseWriter, r *http.Request) {
 		replyEndpointGone(w, "endpoint must be an https URL")
 		return
 	}
+	if req.Topic != "" && !pushTopicPattern.MatchString(req.Topic) {
+		http.Error(w, "topic must be 1-32 URL-safe base64 characters", http.StatusBadRequest)
+		return
+	}
 
 	sub := &webpush.Subscription{
 		Endpoint: req.Endpoint,
@@ -230,6 +239,7 @@ func handlePushSend(w http.ResponseWriter, r *http.Request) {
 		VAPIDPublicKey:  vapidPublicKey,
 		VAPIDPrivateKey: vapidPrivateKey,
 		TTL:             ttl,
+		Topic:           req.Topic,
 		// We ask for high urgency because push services hold back normal pushes while a phone dozes.
 		Urgency:    webpush.UrgencyHigh,
 		HTTPClient: pushHTTPClient,
