@@ -17,10 +17,19 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
 	"log"
+	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"syscall"
+	"time"
 
 	webpush "github.com/SherClockHolmes/webpush-go"
 )
@@ -37,12 +46,13 @@ type vapidKeyfile struct {
 }
 
 // vapidKeyPath returns where the VAPID keypair is persisted.  Defaults
-// to vapid.json in the working directory; override with VAPID_KEY_FILE.
+// to data/vapid.json, the directory the stack mounts as a volume, so the
+// key survives a redeploy; override with VAPID_KEY_FILE.
 func vapidKeyPath() string {
 	if p := os.Getenv("VAPID_KEY_FILE"); p != "" {
 		return p
 	}
-	return filepath.Join(".", "vapid.json")
+	return filepath.Join("data", "vapid.json")
 }
 
 // InitWebPush loads the VAPID keypair from disk, generating and
@@ -52,27 +62,25 @@ func vapidKeyPath() string {
 // existing subscription.
 func InitWebPush() error {
 	path := vapidKeyPath()
-	if data, err := os.ReadFile(path); err == nil {
-		var k vapidKeyfile
-		if json.Unmarshal(data, &k) == nil && k.Private != "" && k.Public != "" {
-			vapidPrivateKey = k.Private
-			vapidPublicKey = k.Public
-		}
+	k, err := readVAPIDKeyfile(path)
+	if errors.Is(err, fs.ErrNotExist) && os.Getenv("VAPID_KEY_FILE") == "" {
+		k, err = adoptLegacyVAPIDKeyfile(path)
 	}
-
-	if vapidPrivateKey == "" || vapidPublicKey == "" {
+	switch {
+	case err == nil:
+		vapidPrivateKey, vapidPublicKey = k.Private, k.Public
+	case errors.Is(err, fs.ErrNotExist):
 		priv, pub, err := webpush.GenerateVAPIDKeys()
 		if err != nil {
 			return err
 		}
 		vapidPrivateKey, vapidPublicKey = priv, pub
-		b, _ := json.MarshalIndent(vapidKeyfile{Private: priv, Public: pub}, "", "  ")
-		if err := os.WriteFile(path, b, 0o600); err != nil {
-			log.Printf("webpush: WARNING could not persist VAPID keys to %s: %v", path, err)
-			log.Printf("webpush: keys are in-memory only; a restart will invalidate all subscriptions")
-		} else {
-			log.Printf("webpush: generated new VAPID keypair -> %s", path)
+		if err := writeVAPIDKeyfile(path, vapidKeyfile{Private: priv, Public: pub}); err != nil {
+			return fmt.Errorf("persist VAPID keyfile %s: %w", path, err)
 		}
+		log.Printf("webpush: generated new VAPID keypair -> %s", path)
+	default:
+		return err
 	}
 
 	// VAPID 'sub' claim: a mailto: or https URL identifying the sender,
@@ -83,6 +91,74 @@ func InitWebPush() error {
 	}
 	log.Printf("webpush: ready (VAPID public key %s…)", truncForLog(vapidPublicKey, 12))
 	return nil
+}
+
+func readVAPIDKeyfile(path string) (vapidKeyfile, error) {
+	var k vapidKeyfile
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return k, err
+	}
+	if err := json.Unmarshal(data, &k); err != nil {
+		return k, fmt.Errorf("unreadable VAPID keyfile %s, fix or remove it: %w", path, err)
+	}
+	if k.Private == "" || k.Public == "" {
+		return k, fmt.Errorf("VAPID keyfile %s is missing a key, fix or remove it", path)
+	}
+	return k, nil
+}
+
+// Earlier releases kept the key in the working directory, so we move it into data/ to keep existing subscriptions valid.
+func adoptLegacyVAPIDKeyfile(path string) (vapidKeyfile, error) {
+	k, err := readVAPIDKeyfile("vapid.json")
+	if err != nil {
+		return k, err
+	}
+	if err := writeVAPIDKeyfile(path, k); err != nil {
+		return k, fmt.Errorf("move legacy VAPID keyfile to %s: %w", path, err)
+	}
+	log.Printf("webpush: moved legacy VAPID keypair vapid.json -> %s", path)
+	return k, nil
+}
+
+// We write through a synced rename so a crash leaves a whole keyfile or none, since InitWebPush refuses to start on a truncated one.
+func writeVAPIDKeyfile(path string, k vapidKeyfile) error {
+	b, err := json.MarshalIndent(k, "", "  ")
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(f.Name(), path); err != nil {
+		return err
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		d.Close()
+		return err
+	}
+	return d.Close()
 }
 
 func truncForLog(s string, n int) string {
@@ -113,7 +189,11 @@ type pushSendRequest struct {
 	Auth     string `json:"auth"`
 	Payload  string `json:"payload"`
 	TTL      int    `json:"ttl"`
+	// The push service keeps only the newest undelivered push per topic (RFC 8030 section 5.4).
+	Topic string `json:"topic"`
 }
+
+var pushTopicPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
 
 // handlePushSend encrypts `payload` for the given subscription and
 // delivers it to the push service.  Guarded by ServerAuthMiddleware
@@ -130,6 +210,14 @@ func handlePushSend(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Endpoint == "" || req.P256dh == "" || req.Auth == "" {
 		http.Error(w, "missing subscription fields", http.StatusBadRequest)
+		return
+	}
+	if !isPushEndpointURL(req.Endpoint) {
+		replyEndpointGone(w, "endpoint must be an https URL")
+		return
+	}
+	if req.Topic != "" && !pushTopicPattern.MatchString(req.Topic) {
+		http.Error(w, "topic must be 1-32 URL-safe base64 characters", http.StatusBadRequest)
 		return
 	}
 
@@ -151,9 +239,17 @@ func handlePushSend(w http.ResponseWriter, r *http.Request) {
 		VAPIDPublicKey:  vapidPublicKey,
 		VAPIDPrivateKey: vapidPrivateKey,
 		TTL:             ttl,
+		Topic:           req.Topic,
+		// We ask for high urgency because push services hold back normal pushes while a phone dozes.
+		Urgency:    webpush.UrgencyHigh,
+		HTTPClient: pushHTTPClient,
 	})
 	if err != nil {
 		log.Printf("webpush: send error to %s: %v", truncForLog(req.Endpoint, 48), err)
+		if errors.Is(err, errInternalAddress) {
+			replyEndpointGone(w, "endpoint resolves to an internal address")
+			return
+		}
 		http.Error(w, "send failed", http.StatusBadGateway)
 		return
 	}
@@ -165,4 +261,68 @@ func handlePushSend(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]int{"status": resp.StatusCode})
+}
+
+// Any logged-in IRC user can register an endpoint, so we POST only to public
+// HTTPS hosts and check the address we actually dial.
+var pushHTTPClient = &http.Client{
+	Timeout: 15 * time.Second,
+	Transport: &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout: 5 * time.Second,
+			Control: refuseInternalAddress,
+		}).DialContext,
+		TLSHandshakeTimeout: 5 * time.Second,
+	},
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+var errInternalAddress = errors.New("push endpoint resolves to an internal address")
+
+func refuseInternalAddress(_, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return err
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil || !isPublicIP(ip.Unmap()) {
+		return errInternalAddress
+	}
+	return nil
+}
+
+var nonPublicPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("2002::/16"),
+}
+
+func isPublicIP(ip netip.Addr) bool {
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		return false
+	}
+	for _, prefix := range nonPublicPrefixes {
+		if prefix.Contains(ip) {
+			return false
+		}
+	}
+	return true
+}
+
+func isPushEndpointURL(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.Scheme == "https" && u.Hostname() != "" && u.User == nil
+}
+
+// We report a refused endpoint as a 410 inside a 200, since obbyircd reads
+// only the body of a 200 and drops the subscription on a 410.
+func replyEndpointGone(w http.ResponseWriter, reason string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": http.StatusGone, "error": reason})
 }
