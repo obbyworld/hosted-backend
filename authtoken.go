@@ -154,7 +154,7 @@ func authTokenToLegacyClaims(c *AuthTokenClaims) *JWTClaims {
 	}
 	if isChannelScope && c.OperatorOf != "" {
 		for _, ch := range strings.Fields(c.OperatorOf) {
-			if strings.EqualFold(ch, target) {
+			if ircFold(ch) == ircFold(target) {
 				out.Cmodes = []string{"o"}
 				break
 			}

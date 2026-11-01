@@ -236,8 +236,7 @@ func main() {
 		fmt.Printf("orca: %v\n", err)
 	}
 
-	r := mux.NewRouter()
-	r.NotFoundHandler = corsHandler(http.NotFoundHandler())
+	r := newRouter()
 
 	// OAuth2 token-endpoint CORS proxy. Browsers can't POST directly to
 	// GitHub's /login/oauth/access_token (no Allow-Origin header). The
@@ -747,7 +746,7 @@ func uploadChannelAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploa
 	// The token's channel modes describe the channel it was minted for, so
 	// we accept it only for that channel.
 	channel := mux.Vars(r)["channel"]
-	if !strings.EqualFold(claims.Channel, channel) {
+	if ircFold(claims.Channel) != ircFold(channel) {
 		http.Error(w, "Token was issued for another channel", http.StatusForbidden)
 		return
 	}
@@ -948,11 +947,30 @@ func removeOldUserAvatar(account string) {
 	}
 }
 
+// Channel names can hold "//" and "..", so we route on the path exactly as sent.
+func newRouter() *mux.Router {
+	r := mux.NewRouter().SkipClean(true)
+	r.NotFoundHandler = corsHandler(http.NotFoundHandler())
+	return r
+}
+
+// The IRCd advertises CASEMAPPING=ascii, so only A-Z fold and names that differ
+// in any other letter stay distinct.
+func ircFold(name string) string {
+	folded := []byte(name)
+	for i, c := range folded {
+		if 'A' <= c && c <= 'Z' {
+			folded[i] = c + 'a' - 'A'
+		}
+	}
+	return string(folded)
+}
+
 // Account and channel names can hold almost any character, so we hex them into
 // the file name to keep each owner's files apart, inside the images folder and
 // safe to put in a URL.
 func avatarFilePrefix(kind, name string) string {
-	return "avatar_" + kind + "_" + hex.EncodeToString([]byte(strings.ToLower(name))) + "_"
+	return "avatar_" + kind + "_" + hex.EncodeToString([]byte(ircFold(name))) + "_"
 }
 
 func removeOldChannelAvatar(channel string) {

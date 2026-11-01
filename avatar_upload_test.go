@@ -4,6 +4,9 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -32,35 +35,77 @@ func TestAvatarFilePrefixKeepsOwnersApart(t *testing.T) {
 	}
 }
 
-func TestChannelAvatarRouteTakesAnyChannelName(t *testing.T) {
+func TestChannelRoutesTakeAnyChannelName(t *testing.T) {
 	var got string
-	r := mux.NewRouter()
-	r.HandleFunc("/upload/avatar/channel/{channel:.+}", func(w http.ResponseWriter, r *http.Request) {
-		got = mux.Vars(r)["channel"]
-	})
-	req := httptest.NewRequest(http.MethodPost, "/upload/avatar/channel/%23a%2Fb%3Fc%25d", nil)
-	r.ServeHTTP(httptest.NewRecorder(), req)
-	if got != "#a/b?c%d" {
-		t.Fatalf("channel = %q, want #a/b?c%%d", got)
+	capture := func(w http.ResponseWriter, r *http.Request) { got = mux.Vars(r)["channel"] }
+	r := newRouter()
+	r.HandleFunc("/upload/avatar/channel/{channel:.+}", capture)
+	r.HandleFunc("/emoji/channel/{channel:.+}.json", capture)
+
+	for _, name := range []string{"#a/b?c%d", "#a//b", "#a/../b"} {
+		escaped := url.PathEscape(name)
+		for _, path := range []string{
+			"/upload/avatar/channel/" + escaped,
+			"/emoji/channel/" + escaped + ".json",
+		} {
+			got = ""
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, nil))
+			if rec.Code != http.StatusOK || got != name {
+				t.Errorf("%s: status %d, channel %q, want %q", path, rec.Code, got, name)
+			}
+		}
+	}
+}
+
+func TestStaticFilesStayInsideTheirFolderWithoutPathCleaning(t *testing.T) {
+	root := t.TempDir()
+	served := filepath.Join(root, "images")
+	if err := os.Mkdir(served, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "secret"), []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := newRouter()
+	r.PathPrefix("/images/").Handler(http.StripPrefix("/images/", http.FileServer(http.Dir(served))))
+
+	for _, path := range []string{"/images/../secret", "/images/%2e%2e/secret", "/images/..%2Fsecret"} {
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if strings.Contains(rec.Body.String(), "secret") && rec.Code == http.StatusOK {
+			t.Errorf("%s served a file outside the folder", path)
+		}
+	}
+}
+
+func TestChannelNamesFoldOnlyASCII(t *testing.T) {
+	if ircFold("#FOO") != ircFold("#foo") {
+		t.Error("ASCII case variants differ")
+	}
+	if ircFold("#Ä") == ircFold("#ä") || avatarFilePrefix("channel", "#Ä") == avatarFilePrefix("channel", "#ä") {
+		t.Error("#Ä and #ä are distinct channels under CASEMAPPING=ascii")
 	}
 }
 
 func TestChannelAvatarRefusesATokenForAnotherChannel(t *testing.T) {
-	claims := authTokenToLegacyClaims(&AuthTokenClaims{
-		Nick:       "alice",
-		Account:    "alice",
-		Scope:      "channel:#mine",
-		OperatorOf: "#mine",
-	})
-	req := httptest.NewRequest(http.MethodPost, "/upload/avatar/channel/%23other", nil)
-	req = mux.SetURLVars(req, map[string]string{"channel": "#other"})
-	req = req.WithContext(context.WithValue(req.Context(), "jwt_claims", claims))
-	rec := httptest.NewRecorder()
+	for _, pair := range [][2]string{{"#mine", "#other"}, {"#Ä", "#ä"}} {
+		claims := authTokenToLegacyClaims(&AuthTokenClaims{
+			Nick:       "alice",
+			Account:    "alice",
+			Scope:      "channel:" + pair[0],
+			OperatorOf: pair[0],
+		})
+		req := httptest.NewRequest(http.MethodPost, "/upload/avatar/channel/"+url.PathEscape(pair[1]), nil)
+		req = mux.SetURLVars(req, map[string]string{"channel": pair[1]})
+		req = req.WithContext(context.WithValue(req.Context(), "jwt_claims", claims))
+		rec := httptest.NewRecorder()
 
-	uploadChannelAvatarHandler(rec, req, 1<<20, false, 0, 0, 0, false)
+		uploadChannelAvatarHandler(rec, req, 1<<20, false, 0, 0, 0, false)
 
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403", rec.Code)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("token for %s on %s: status %d, want 403", pair[0], pair[1], rec.Code)
+		}
 	}
 }
 
