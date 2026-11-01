@@ -18,6 +18,7 @@ type JWTClaims struct {
 	Account string   `json:"account"`
 	Umodes  []string `json:"umodes"`
 	Cmodes  []string `json:"cmodes"`
+	Channel string   `json:"channel"`
 	jwt.RegisteredClaims
 }
 

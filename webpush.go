@@ -279,7 +279,7 @@ var pushHTTPClient = &http.Client{
 	},
 }
 
-var errInternalAddress = errors.New("push endpoint resolves to an internal address")
+var errInternalAddress = errors.New("address resolves to an internal network")
 
 func refuseInternalAddress(_, address string, _ syscall.RawConn) error {
 	host, _, err := net.SplitHostPort(address)

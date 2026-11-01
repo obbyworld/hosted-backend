@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/jpeg"
@@ -234,7 +236,7 @@ func main() {
 		fmt.Printf("orca: %v\n", err)
 	}
 
-	r := mux.NewRouter()
+	r := newRouter()
 
 	// OAuth2 token-endpoint CORS proxy. Browsers can't POST directly to
 	// GitHub's /login/oauth/access_token (no Allow-Origin header). The
@@ -275,7 +277,7 @@ func main() {
 		uploadUserAvatarHandler(w, r, maxUploadSize, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
 	})).Methods("POST", "OPTIONS")
 
-	r.HandleFunc("/upload/avatar/channel/{channel}", AuthTokenMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	r.HandleFunc("/upload/avatar/channel/{channel:.+}", AuthTokenMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		uploadChannelAvatarHandler(w, r, maxUploadSize, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
 	})).Methods("POST", "OPTIONS")
 
@@ -422,15 +424,13 @@ func uploadHandler(w http.ResponseWriter, r *http.Request, port string, deleteTi
 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
 			return
 		}
-		resp, err := http.Get(req.URL)
-		if err != nil || resp.StatusCode != http.StatusOK {
-			http.Error(w, "Failed to download upload", http.StatusInternalServerError)
+		body, err := downloadPublicURL(req.URL, mediaCfg.MaxUploadBytes)
+		if errors.Is(err, errDownloadTooLarge) {
+			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
 			return
 		}
-		defer resp.Body.Close()
-		body, err := io.ReadAll(io.LimitReader(resp.Body, mediaCfg.MaxUploadBytes))
 		if err != nil {
-			http.Error(w, "Failed to read downloaded upload", http.StatusInternalServerError)
+			http.Error(w, "Failed to download upload", http.StatusBadGateway)
 			return
 		}
 		filename = filepath.Base(req.URL)
@@ -595,7 +595,7 @@ func uploadUserAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploadSi
 
 		// Generate unique filename
 		timestamp := time.Now().UnixNano()
-		filename := fmt.Sprintf("avatar_user_%s_%d.%s", account, timestamp, format)
+		filename := fmt.Sprintf("%s%d.%s", avatarFilePrefix("user", account), timestamp, format)
 		filePath := filepath.Join("images", filename)
 
 		// Save the processed image
@@ -638,7 +638,7 @@ func uploadUserAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploadSi
 
 		// Generate unique filename
 		timestamp := time.Now().UnixNano()
-		filename := fmt.Sprintf("avatar_user_%s_%d.%s", claims.Account, timestamp, format)
+		filename := fmt.Sprintf("%s%d.%s", avatarFilePrefix("user", claims.Account), timestamp, format)
 		filePath := filepath.Join("images", filename)
 
 		// Save the processed image
@@ -670,22 +670,13 @@ func uploadUserAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploadSi
 		}
 
 		// Download image from URL
-		resp, err := http.Get(req.URL)
-		if err != nil {
-			http.Error(w, "Failed to download image", http.StatusInternalServerError)
+		data, err := downloadPublicURL(req.URL, maxUploadSize)
+		if errors.Is(err, errDownloadTooLarge) {
+			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
 			return
 		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			http.Error(w, "Failed to download image", http.StatusInternalServerError)
-			return
-		}
-
-		// Read image data
-		data, err := io.ReadAll(resp.Body)
 		if err != nil {
-			http.Error(w, "Failed to read downloaded image", http.StatusInternalServerError)
+			http.Error(w, "Failed to download image", http.StatusBadGateway)
 			return
 		}
 
@@ -701,7 +692,7 @@ func uploadUserAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploadSi
 
 		// Generate unique filename
 		timestamp := time.Now().UnixNano()
-		filename := fmt.Sprintf("avatar_user_%s_%d.%s", claims.Account, timestamp, format)
+		filename := fmt.Sprintf("%s%d.%s", avatarFilePrefix("user", claims.Account), timestamp, format)
 		filePath := filepath.Join("images", filename)
 
 		// Save the processed image
@@ -752,6 +743,14 @@ func uploadChannelAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploa
 		return
 	}
 
+	// The token's channel modes describe the channel it was minted for, so
+	// we accept it only for that channel.
+	channel := mux.Vars(r)["channel"]
+	if ircFold(claims.Channel) != ircFold(channel) {
+		http.Error(w, "Token was issued for another channel", http.StatusForbidden)
+		return
+	}
+
 	// Check channel permissions - must have 'o', 'a', or 'q' in cmodes
 	hasPermission := false
 	for _, mode := range claims.Cmodes {
@@ -762,14 +761,6 @@ func uploadChannelAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploa
 	}
 	if !hasPermission {
 		http.Error(w, "Channel operator/admin/owner permission required", http.StatusForbidden)
-		return
-	}
-
-	// Get channel from URL
-	vars := mux.Vars(r)
-	channel := vars["channel"]
-	if channel == "" {
-		http.Error(w, "Channel name required", http.StatusBadRequest)
 		return
 	}
 
@@ -817,7 +808,7 @@ func uploadChannelAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploa
 
 		// Generate unique filename
 		timestamp := time.Now().UnixNano()
-		filename := fmt.Sprintf("avatar_channel_%s_%d.%s", strings.ReplaceAll(channel, "#", "_hash_"), timestamp, format)
+		filename := fmt.Sprintf("%s%d.%s", avatarFilePrefix("channel", channel), timestamp, format)
 		filePath := filepath.Join("images", filename)
 
 		// Save the processed image
@@ -860,7 +851,7 @@ func uploadChannelAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploa
 
 		// Generate unique filename
 		timestamp := time.Now().UnixNano()
-		filename := fmt.Sprintf("avatar_channel_%s_%d.%s", strings.ReplaceAll(channel, "#", "_hash_"), timestamp, format)
+		filename := fmt.Sprintf("%s%d.%s", avatarFilePrefix("channel", channel), timestamp, format)
 		filePath := filepath.Join("images", filename)
 
 		// Save the processed image
@@ -892,22 +883,13 @@ func uploadChannelAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploa
 		}
 
 		// Download image from URL
-		resp, err := http.Get(req.URL)
-		if err != nil {
-			http.Error(w, "Failed to download image", http.StatusInternalServerError)
+		data, err := downloadPublicURL(req.URL, maxUploadSize)
+		if errors.Is(err, errDownloadTooLarge) {
+			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
 			return
 		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			http.Error(w, "Failed to download image", http.StatusInternalServerError)
-			return
-		}
-
-		// Read image data
-		data, err := io.ReadAll(resp.Body)
 		if err != nil {
-			http.Error(w, "Failed to read downloaded image", http.StatusInternalServerError)
+			http.Error(w, "Failed to download image", http.StatusBadGateway)
 			return
 		}
 
@@ -923,7 +905,7 @@ func uploadChannelAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploa
 
 		// Generate unique filename
 		timestamp := time.Now().UnixNano()
-		filename := fmt.Sprintf("avatar_channel_%s_%d.%s", strings.ReplaceAll(channel, "#", "_hash_"), timestamp, format)
+		filename := fmt.Sprintf("%s%d.%s", avatarFilePrefix("channel", channel), timestamp, format)
 		filePath := filepath.Join("images", filename)
 
 		// Save the processed image
@@ -957,11 +939,38 @@ func removeOldUserAvatar(account string) {
 		return
 	}
 
+	prefix := avatarFilePrefix("user", account)
 	for _, file := range files {
-		if strings.HasPrefix(file.Name(), "avatar_user_"+account+"_") {
+		if strings.HasPrefix(file.Name(), prefix) {
 			os.Remove(filepath.Join("images", file.Name()))
 		}
 	}
+}
+
+// Channel names can hold "//" and "..", so we route on the path exactly as sent.
+func newRouter() *mux.Router {
+	r := mux.NewRouter().SkipClean(true)
+	r.NotFoundHandler = corsHandler(http.NotFoundHandler())
+	return r
+}
+
+// The IRCd advertises CASEMAPPING=ascii, so only A-Z fold and names that differ
+// in any other letter stay distinct.
+func ircFold(name string) string {
+	folded := []byte(name)
+	for i, c := range folded {
+		if 'A' <= c && c <= 'Z' {
+			folded[i] = c + 'a' - 'A'
+		}
+	}
+	return string(folded)
+}
+
+// Account and channel names can hold almost any character, so we hex them into
+// the file name to keep each owner's files apart, inside the images folder and
+// safe to put in a URL.
+func avatarFilePrefix(kind, name string) string {
+	return "avatar_" + kind + "_" + hex.EncodeToString([]byte(ircFold(name))) + "_"
 }
 
 func removeOldChannelAvatar(channel string) {
@@ -970,9 +979,9 @@ func removeOldChannelAvatar(channel string) {
 		return
 	}
 
-	safeChannel := strings.ReplaceAll(channel, "#", "_hash_")
+	prefix := avatarFilePrefix("channel", channel)
 	for _, file := range files {
-		if strings.HasPrefix(file.Name(), "avatar_channel_"+safeChannel+"_") {
+		if strings.HasPrefix(file.Name(), prefix) {
 			os.Remove(filepath.Join("images", file.Name()))
 		}
 	}
