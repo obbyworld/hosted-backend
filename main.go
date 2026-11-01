@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -235,6 +236,7 @@ func main() {
 	}
 
 	r := mux.NewRouter()
+	r.NotFoundHandler = corsHandler(http.NotFoundHandler())
 
 	// OAuth2 token-endpoint CORS proxy. Browsers can't POST directly to
 	// GitHub's /login/oauth/access_token (no Allow-Origin header). The
@@ -275,7 +277,7 @@ func main() {
 		uploadUserAvatarHandler(w, r, maxUploadSize, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
 	})).Methods("POST", "OPTIONS")
 
-	r.HandleFunc("/upload/avatar/channel/{channel}", AuthTokenMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	r.HandleFunc("/upload/avatar/channel/{channel:.+}", AuthTokenMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		uploadChannelAvatarHandler(w, r, maxUploadSize, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
 	})).Methods("POST", "OPTIONS")
 
@@ -752,6 +754,14 @@ func uploadChannelAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploa
 		return
 	}
 
+	// The token's channel modes describe the channel it was minted for, so
+	// we accept it only for that channel.
+	channel := mux.Vars(r)["channel"]
+	if !strings.EqualFold(claims.Channel, channel) {
+		http.Error(w, "Token was issued for another channel", http.StatusForbidden)
+		return
+	}
+
 	// Check channel permissions - must have 'o', 'a', or 'q' in cmodes
 	hasPermission := false
 	for _, mode := range claims.Cmodes {
@@ -762,14 +772,6 @@ func uploadChannelAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploa
 	}
 	if !hasPermission {
 		http.Error(w, "Channel operator/admin/owner permission required", http.StatusForbidden)
-		return
-	}
-
-	// Get channel from URL
-	vars := mux.Vars(r)
-	channel := vars["channel"]
-	if channel == "" {
-		http.Error(w, "Channel name required", http.StatusBadRequest)
 		return
 	}
 
@@ -817,7 +819,7 @@ func uploadChannelAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploa
 
 		// Generate unique filename
 		timestamp := time.Now().UnixNano()
-		filename := fmt.Sprintf("avatar_channel_%s_%d.%s", strings.ReplaceAll(channel, "#", "_hash_"), timestamp, format)
+		filename := fmt.Sprintf("%s%d.%s", channelAvatarPrefix(channel), timestamp, format)
 		filePath := filepath.Join("images", filename)
 
 		// Save the processed image
@@ -860,7 +862,7 @@ func uploadChannelAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploa
 
 		// Generate unique filename
 		timestamp := time.Now().UnixNano()
-		filename := fmt.Sprintf("avatar_channel_%s_%d.%s", strings.ReplaceAll(channel, "#", "_hash_"), timestamp, format)
+		filename := fmt.Sprintf("%s%d.%s", channelAvatarPrefix(channel), timestamp, format)
 		filePath := filepath.Join("images", filename)
 
 		// Save the processed image
@@ -923,7 +925,7 @@ func uploadChannelAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploa
 
 		// Generate unique filename
 		timestamp := time.Now().UnixNano()
-		filename := fmt.Sprintf("avatar_channel_%s_%d.%s", strings.ReplaceAll(channel, "#", "_hash_"), timestamp, format)
+		filename := fmt.Sprintf("%s%d.%s", channelAvatarPrefix(channel), timestamp, format)
 		filePath := filepath.Join("images", filename)
 
 		// Save the processed image
@@ -964,15 +966,21 @@ func removeOldUserAvatar(account string) {
 	}
 }
 
+// Channel names can hold almost any character, so we hex them into the file
+// name to keep each channel's files apart and inside the images folder.
+func channelAvatarPrefix(channel string) string {
+	return "avatar_channel_" + hex.EncodeToString([]byte(strings.ToLower(channel))) + "_"
+}
+
 func removeOldChannelAvatar(channel string) {
 	files, err := os.ReadDir("images")
 	if err != nil {
 		return
 	}
 
-	safeChannel := strings.ReplaceAll(channel, "#", "_hash_")
+	prefix := channelAvatarPrefix(channel)
 	for _, file := range files {
-		if strings.HasPrefix(file.Name(), "avatar_channel_"+safeChannel+"_") {
+		if strings.HasPrefix(file.Name(), prefix) {
 			os.Remove(filepath.Join("images", file.Name()))
 		}
 	}

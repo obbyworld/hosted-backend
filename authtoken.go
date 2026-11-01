@@ -148,8 +148,11 @@ func authTokenToLegacyClaims(c *AuthTokenClaims) *JWTClaims {
 		Sub:     c.Nick,
 		Account: c.Account,
 	}
-	if strings.HasPrefix(c.Scope, "channel:") && c.OperatorOf != "" {
-		target := strings.TrimPrefix(c.Scope, "channel:")
+	target, isChannelScope := strings.CutPrefix(c.Scope, "channel:")
+	if isChannelScope {
+		out.Channel = target
+	}
+	if isChannelScope && c.OperatorOf != "" {
 		for _, ch := range strings.Fields(c.OperatorOf) {
 			if strings.EqualFold(ch, target) {
 				out.Cmodes = []string{"o"}

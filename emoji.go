@@ -522,7 +522,7 @@ func registerEmojiRoutes(r *mux.Router) {
 	// to fetch the pack.
 	r.HandleFunc("/emoji/pack.json", handleEmojiPackJSON).
 		Methods("GET", "OPTIONS")
-	r.HandleFunc("/emoji/channel/{channel}.json", handleEmojiChannelJSON).
+	r.HandleFunc("/emoji/channel/{channel:.+}.json", handleEmojiChannelJSON).
 		Methods("GET", "OPTIONS")
 
 	// Admin endpoints under /emoji/admin/* -- AuthMiddleware enforces
