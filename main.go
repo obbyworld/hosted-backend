@@ -57,8 +57,12 @@ func setCORSHeaders(w http.ResponseWriter) {
 
 // processImage processes images based on configuration
 func processImage(data []byte, author string, jwtExpiry time.Time, serverExpiry time.Time, compressionEnabled bool, maxWidth, maxHeight, jpegQuality int, convertToJpeg bool) ([]byte, string, error) {
-	// Decode image
-	img, format, err := image.Decode(bytes.NewReader(data))
+	_, format, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, "", err
+	}
+	// We drop all EXIF on re-encode, so we bake the Orientation tag into the pixels first.
+	img, err := imaging.Decode(bytes.NewReader(data), imaging.AutoOrientation(true))
 	if err != nil {
 		return nil, "", err
 	}
