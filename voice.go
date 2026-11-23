@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"sort"
 	"strconv"
@@ -38,6 +39,8 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/turn/v3"
 	"github.com/pion/webrtc/v4"
+
+	"backend/netguard"
 )
 
 /* =====================================================================
@@ -204,6 +207,7 @@ func startTurnServer(cfg VoiceConfig) (*turn.Server, error) {
 		Realm:       cfg.Realm,
 		AuthHandler: turnAuthHandler(cfg),
 	}
+	allowPeer := turnPeerFilter(cfg.PublicIP)
 
 	// UDP listener -- only useful if the host's firewall actually
 	// permits UDP on TurnPort.  We attempt to bind and skip silently
@@ -214,6 +218,7 @@ func startTurnServer(cfg VoiceConfig) (*turn.Server, error) {
 			turn.PacketConnConfig{
 				PacketConn:            udpConn,
 				RelayAddressGenerator: relayGen,
+				PermissionHandler:     allowPeer,
 			})
 		log.Printf("voice: TURN UDP listening on %s", addr)
 	} else {
@@ -228,6 +233,7 @@ func startTurnServer(cfg VoiceConfig) (*turn.Server, error) {
 			turn.ListenerConfig{
 				Listener:              tcpLn,
 				RelayAddressGenerator: relayGen,
+				PermissionHandler:     allowPeer,
 			})
 		log.Printf("voice: TURN TCP listening on %s", addr)
 	} else {
@@ -250,6 +256,17 @@ func startTurnServer(cfg VoiceConfig) (*turn.Server, error) {
 	}
 	log.Printf("voice: TURN server up (public %s, realm %q)", publicIP, cfg.Realm)
 	return srv, nil
+}
+
+// We always relay to the IP the SFU advertises, even a private one, since
+// clients that only get out over TCP reach the SFU through this relay.
+func turnPeerFilter(sfuIP string) turn.PermissionHandler {
+	sfu, _ := netip.ParseAddr(sfuIP)
+	return func(_ net.Addr, peerIP net.IP) bool {
+		ip, ok := netip.AddrFromSlice(peerIP)
+		ip = ip.Unmap()
+		return ok && (netguard.IsPublicIP(ip) || (sfu.IsValid() && ip == sfu.Unmap()))
+	}
 }
 
 /* =====================================================================

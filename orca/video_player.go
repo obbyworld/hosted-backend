@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/pion/rtp"
+
+	"backend/netguard"
 )
 
 // Video playback constants. Tuned for the SFU's clients (browsers
@@ -322,6 +324,15 @@ func isImageFile(path string) (bool, error) {
 	return len(ct) >= 6 && ct[:6] == "image/", nil
 }
 
+// Chat users choose the URL, so we dial only public hosts, on every redirect too.
+var videoHTTPClient = &http.Client{Transport: videoTransport()}
+
+func videoTransport() *http.Transport {
+	t := netguard.NewTransport()
+	t.ForceAttemptHTTP2 = true
+	return t
+}
+
 // downloadVideoToTemp fetches the URL into a fresh tempfile and
 // returns the path. Caller is responsible for os.Remove. Uses Go's
 // http.Client (HTTP/2-savvy) instead of ffmpeg's built-in HTTPS
@@ -333,7 +344,7 @@ func downloadVideoToTemp(ctx context.Context, url string) (string, error) {
 		return "", err
 	}
 	req.Header.Set("User-Agent", "obbyircd-orca/0.1")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := videoHTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}

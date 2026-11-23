@@ -21,17 +21,16 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
-	"net"
 	"net/http"
-	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
-	"syscall"
 	"time"
 
 	webpush "github.com/SherClockHolmes/webpush-go"
+
+	"backend/netguard"
 )
 
 var (
@@ -246,7 +245,7 @@ func handlePushSend(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		log.Printf("webpush: send error to %s: %v", truncForLog(req.Endpoint, 48), err)
-		if errors.Is(err, errInternalAddress) {
+		if errors.Is(err, netguard.ErrInternalAddress) {
 			replyEndpointGone(w, "endpoint resolves to an internal address")
 			return
 		}
@@ -266,52 +265,11 @@ func handlePushSend(w http.ResponseWriter, r *http.Request) {
 // Any logged-in IRC user can register an endpoint, so we POST only to public
 // HTTPS hosts and check the address we actually dial.
 var pushHTTPClient = &http.Client{
-	Timeout: 15 * time.Second,
-	Transport: &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout: 5 * time.Second,
-			Control: refuseInternalAddress,
-		}).DialContext,
-		TLSHandshakeTimeout: 5 * time.Second,
-	},
+	Timeout:   15 * time.Second,
+	Transport: netguard.NewTransport(),
 	CheckRedirect: func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	},
-}
-
-var errInternalAddress = errors.New("address resolves to an internal network")
-
-func refuseInternalAddress(_, address string, _ syscall.RawConn) error {
-	host, _, err := net.SplitHostPort(address)
-	if err != nil {
-		return err
-	}
-	ip, err := netip.ParseAddr(host)
-	if err != nil || !isPublicIP(ip.Unmap()) {
-		return errInternalAddress
-	}
-	return nil
-}
-
-var nonPublicPrefixes = []netip.Prefix{
-	netip.MustParsePrefix("100.64.0.0/10"),
-	netip.MustParsePrefix("240.0.0.0/4"),
-	netip.MustParsePrefix("198.18.0.0/15"),
-	netip.MustParsePrefix("64:ff9b::/96"),
-	netip.MustParsePrefix("64:ff9b:1::/48"),
-	netip.MustParsePrefix("2002::/16"),
-}
-
-func isPublicIP(ip netip.Addr) bool {
-	if !ip.IsGlobalUnicast() || ip.IsPrivate() {
-		return false
-	}
-	for _, prefix := range nonPublicPrefixes {
-		if prefix.Contains(ip) {
-			return false
-		}
-	}
-	return true
 }
 
 func isPushEndpointURL(raw string) bool {

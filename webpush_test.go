@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"backend/netguard"
 )
 
 func TestPushEndpointMustBeHTTPS(t *testing.T) {
@@ -37,11 +39,11 @@ func TestPushRefusesInternalAddresses(t *testing.T) {
 		"[::ffff:127.0.0.1]:443", "[::ffff:10.0.0.1]:443", "240.0.0.1:443", "198.18.0.1:443",
 		"[64:ff9b::a00:1]:443", "[64:ff9b:1::a00:1]:443", "[2002:a00:1::1]:443",
 	} {
-		if refuseInternalAddress("tcp", address, nil) == nil {
+		if netguard.RefuseInternalAddress("tcp", address, nil) == nil {
 			t.Errorf("allowed %s", address)
 		}
 	}
-	if err := refuseInternalAddress("tcp", net.JoinHostPort("142.250.74.106", "443"), nil); err != nil {
+	if err := netguard.RefuseInternalAddress("tcp", net.JoinHostPort("142.250.74.106", "443"), nil); err != nil {
 		t.Errorf("refused a public address: %v", err)
 	}
 }

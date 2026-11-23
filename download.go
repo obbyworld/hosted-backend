@@ -4,10 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"time"
+
+	"backend/netguard"
 )
 
 var errDownloadTooLarge = errors.New("download exceeds the configured size limit")
@@ -15,14 +16,8 @@ var errDownloadTooLarge = errors.New("download exceeds the configured size limit
 // Clients choose the address we download from, so we dial only public hosts,
 // on every redirect too.
 var downloadHTTPClient = &http.Client{
-	Timeout: 30 * time.Second,
-	Transport: &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout: 5 * time.Second,
-			Control: refuseInternalAddress,
-		}).DialContext,
-		TLSHandshakeTimeout: 5 * time.Second,
-	},
+	Timeout:   30 * time.Second,
+	Transport: netguard.NewTransport(),
 }
 
 func downloadPublicURL(rawURL string, limit int64) ([]byte, error) {

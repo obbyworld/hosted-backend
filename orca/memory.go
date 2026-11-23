@@ -3,6 +3,7 @@ package orca
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -10,17 +11,18 @@ import (
 	"backend/ai"
 )
 
-// ConvKey identifies a conversation thread.  PMs are keyed per-caller;
-// channel threads are keyed by channel name and shared across speakers
-// (the model is told who is currently speaking and when it changes).
+// ConvKey identifies a conversation thread. Private threads (every /ask,
+// whose replies are whispered) belong to one invoker; channel threads are
+// keyed by channel name and shared across speakers (the model is told who
+// is currently speaking and when it changes).
 type ConvKey struct {
 	Channel string // channel name or ""
-	PMNick  string // peer nick if PM, else ""
+	Private string // "account:<name>" or "nick:<name>" of the invoker, else ""
 }
 
 func (k ConvKey) String() string {
-	if k.PMNick != "" {
-		return "pm:" + k.PMNick
+	if k.Private != "" {
+		return "private:" + k.Private
 	}
 	return k.Channel
 }
@@ -42,7 +44,9 @@ type Conversation struct {
 	Turns       []ConvTurn
 	LastSpeaker string
 	Summary     string // older-turns LLM summary, refreshed on compaction
-	mu          sync.Mutex
+	// SummaryHasToolOutput is set once a compaction folds in a tool call or result.
+	SummaryHasToolOutput bool
+	mu                   sync.Mutex
 }
 
 func (c *Conversation) append(t ConvTurn) {
@@ -98,14 +102,19 @@ func (m *Memory) Reset(key ConvKey) {
 // previous speaker on the same conversation; an extra system note marks
 // the change so the model treats it as a new participant rather than the
 // last one continuing.
-func (m *Memory) BuildMessages(conv *Conversation, sysPrompt, speakerNote, userQuery string) []ai.Message {
+//
+// Tool results, the assistant replies that can restate them, and a summary
+// built from them hold oper-only server data, so we leave them out when oper
+// is false.
+func (m *Memory) BuildMessages(conv *Conversation, oper bool, sysPrompt, speakerNote, userQuery string) []ai.Message {
 	conv.mu.Lock()
 	turns := append([]ConvTurn{}, conv.Turns...)
 	summary := conv.Summary
+	summaryHasToolOutput := conv.SummaryHasToolOutput
 	conv.mu.Unlock()
 
 	out := []ai.Message{{Role: ai.RoleSystem, Content: sysPrompt}}
-	if summary != "" {
+	if summary != "" && (oper || !summaryHasToolOutput) {
 		out = append(out, ai.Message{
 			Role:    ai.RoleSystem,
 			Content: "Earlier in this conversation (summary):\n" + summary,
@@ -129,7 +138,17 @@ func (m *Memory) BuildMessages(conv *Conversation, sysPrompt, speakerNote, userQ
 		}
 		start++
 	}
+	exchangeUsedTools := false
 	for _, t := range turns[start:] {
+		if t.Role == ai.RoleUser {
+			exchangeUsedTools = false
+		}
+		if usesTools(t) {
+			exchangeUsedTools = true
+		}
+		if !oper && exchangeUsedTools && t.Role != ai.RoleUser {
+			continue
+		}
 		switch t.Role {
 		case ai.RoleUser:
 			label := "[" + t.Nick + "]"
@@ -288,6 +307,11 @@ func (m *Memory) MaybeCompact(ctx context.Context, conv *Conversation) {
 
 	conv.mu.Lock()
 	conv.Summary = strings.TrimSpace(resp.Message.Content)
+	conv.SummaryHasToolOutput = conv.SummaryHasToolOutput || slices.ContainsFunc(older, usesTools)
 	conv.Turns = conv.Turns[cutoff:]
 	conv.mu.Unlock()
+}
+
+func usesTools(t ConvTurn) bool {
+	return t.Role == ai.RoleTool || len(t.ToolCalls) > 0
 }

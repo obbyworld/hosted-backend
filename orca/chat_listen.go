@@ -206,7 +206,8 @@ func (o *Orca) handleChannelMessage(ctx context.Context, m bot.MessageCreate) {
 		return
 	}
 
-	go o.runChatReply(ctx, channel, speaker, query, m.Msgid)
+	oper, _ := m.Author["is_oper"].(bool)
+	go o.runChatReply(ctx, channel, speaker, oper, query, m.Msgid)
 }
 
 // addressMatcher lazily builds the matcher once and caches it. Nick
@@ -223,7 +224,7 @@ func (o *Orca) addressMatcher() *addressMatcher {
 // runChatReply is the per-message worker: same tool-loop shape as
 // askPlain but tuned for chat (text output, longer context budget, no
 // TTS). Posts the reply with SendMessage.
-func (o *Orca) runChatReply(ctx context.Context, channel, speaker, query, triggerMsgid string) {
+func (o *Orca) runChatReply(ctx context.Context, channel, speaker string, oper bool, query, triggerMsgid string) {
 	gw := o.Gateway()
 	if gw == nil {
 		log.Printf("[orca/chat] %s/%s: no gateway, can't reply", channel, speaker)
@@ -251,8 +252,8 @@ func (o *Orca) runChatReply(ctx context.Context, channel, speaker, query, trigge
 		Role: ai.RoleUser, Nick: speaker, Time: now, Content: query,
 	})
 
-	messages := o.memory.BuildMessages(conv, sysPrompt, speakerNote, "")
-	tools := o.aiTools()
+	messages := o.memory.BuildMessages(conv, oper, sysPrompt, speakerNote, "")
+	tools := o.aiTools(oper)
 
 	// Workflow card for the floating bot-tools UI. Lifetime is the
 	// whole tool-call loop; we mark complete when the model returns
@@ -306,7 +307,7 @@ func (o *Orca) runChatReply(ctx context.Context, channel, speaker, query, trigge
 			if tc.Function.Arguments != "" {
 				_ = json.Unmarshal([]byte(tc.Function.Arguments), &params)
 			}
-			result, terr := o.invokeAITool(ctx, tc.Function.Name, params, w)
+			result, terr := o.invokeAITool(ctx, oper, tc.Function.Name, params, w)
 			if terr != nil {
 				result = fmt.Sprintf(`{"error":%q}`, terr.Error())
 			}

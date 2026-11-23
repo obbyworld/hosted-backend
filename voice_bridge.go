@@ -69,24 +69,34 @@ type voiceBridge struct {
 	// check.
 	connEpoch atomic.Uint64
 
-	// Reassembly buffers for chunked SDP signals (offer / answer).
-	// Keyed by sender-nick + chunk-id; entries are dropped on
-	// completion or reset on bridge reconnect.
+	// Chunked SDP reassembly buffers by sender nick, then chunk id.
 	chunkMu  sync.Mutex
-	chunkBuf map[string]*sdpChunkBuf
+	chunkBuf map[string]map[string]*sdpChunkBuf
+	now      func() time.Time
 }
 
 type sdpChunkBuf struct {
-	parts    []string
-	received int
-	template signalEnvelope // metadata copied from chunk #0
+	parts     []string
+	received  int
+	template  signalEnvelope // metadata copied from chunk #0
+	lastChunk time.Time
 }
+
+// Clients slice an SDP into chunks of roughly 2.5 to 7.8 KB, so a real
+// offer needs well under ten of them. ObbyIRCd fake lag can hold each full
+// chunk back for about 30 seconds, so we expire buffers only when idle.
+const (
+	maxSDPChunks         = 64
+	maxOpenChunksPerPeer = 4
+	chunkIdleTimeout     = 120 * time.Second
+)
 
 func newVoiceBridge(cfg VoiceConfig, mgr *voiceManager) *voiceBridge {
 	return &voiceBridge{
 		cfg:      cfg,
 		mgr:      mgr,
-		chunkBuf: map[string]*sdpChunkBuf{},
+		chunkBuf: map[string]map[string]*sdpChunkBuf{},
+		now:      time.Now,
 	}
 }
 
@@ -99,38 +109,71 @@ func (b *voiceBridge) assembleChunk(from string, env signalEnvelope) *signalEnve
 		copy := env
 		return &copy
 	}
-	key := from + "\x00" + env.ChunkID
-	b.chunkMu.Lock()
-	defer b.chunkMu.Unlock()
-	buf := b.chunkBuf[key]
-	if buf == nil {
-		buf = &sdpChunkBuf{
-			parts:    make([]string, *env.Total),
-			template: env,
-		}
-		b.chunkBuf[key] = buf
-	}
-	if *env.Seq < 0 || *env.Seq >= len(buf.parts) {
-		log.Printf("voice: chunk seq %d out of range (total=%d)", *env.Seq, len(buf.parts))
-		delete(b.chunkBuf, key)
+	total, seq := *env.Total, *env.Seq
+	if total > maxSDPChunks || seq < 0 || seq >= total {
+		log.Printf("voice: chunk seq %d / total %d from %s refused", seq, total, from)
 		return nil
 	}
-	if buf.parts[*env.Seq] != "" {
+	b.chunkMu.Lock()
+	defer b.chunkMu.Unlock()
+	now := b.now()
+	b.dropIdleChunksLocked(now)
+	open := b.chunkBuf[from]
+	if open == nil {
+		open = map[string]*sdpChunkBuf{}
+		b.chunkBuf[from] = open
+	}
+	buf := open[env.ChunkID]
+	if buf == nil {
+		if len(open) >= maxOpenChunksPerPeer {
+			log.Printf("voice: %s has too many unfinished chunked signals", from)
+			return nil
+		}
+		buf = &sdpChunkBuf{
+			parts:    make([]string, total),
+			template: env,
+		}
+		open[env.ChunkID] = buf
+	}
+	if seq >= len(buf.parts) {
+		log.Printf("voice: chunk seq %d out of range (total=%d)", seq, len(buf.parts))
+		b.dropChunkLocked(from, env.ChunkID)
+		return nil
+	}
+	if buf.parts[seq] != "" {
 		// Duplicate chunk -- ignore.
 		return nil
 	}
-	buf.parts[*env.Seq] = env.SDP
+	buf.parts[seq] = env.SDP
 	buf.received++
+	buf.lastChunk = now
 	if buf.received < len(buf.parts) {
 		return nil
 	}
-	delete(b.chunkBuf, key)
+	b.dropChunkLocked(from, env.ChunkID)
 	full := buf.template
 	full.SDP = strings.Join(buf.parts, "")
 	full.ChunkID = ""
 	full.Seq = nil
 	full.Total = nil
 	return &full
+}
+
+func (b *voiceBridge) dropChunkLocked(from, id string) {
+	delete(b.chunkBuf[from], id)
+	if len(b.chunkBuf[from]) == 0 {
+		delete(b.chunkBuf, from)
+	}
+}
+
+func (b *voiceBridge) dropIdleChunksLocked(now time.Time) {
+	for from, open := range b.chunkBuf {
+		for id, buf := range open {
+			if now.Sub(buf.lastChunk) > chunkIdleTimeout {
+				b.dropChunkLocked(from, id)
+			}
+		}
+	}
 }
 
 func (b *voiceBridge) listenAndServe(ctx context.Context) error {

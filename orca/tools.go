@@ -18,7 +18,12 @@ type Tool struct {
 	Handler     func(ctx context.Context, o *Orca, params map[string]any, w *bot.WorkflowEmitter) (string, error)
 }
 
-func (o *Orca) aiTools() []ai.ToolSpec {
+// Every tool reads or changes server state that only opers can see, such as
+// user IPs, secret channels and bans, so we give the model no tools for other users.
+func (o *Orca) aiTools(oper bool) []ai.ToolSpec {
+	if !oper {
+		return nil
+	}
 	o.cmdMu.RLock()
 	defer o.cmdMu.RUnlock()
 	out := make([]ai.ToolSpec, 0, len(o.aiToolMap))

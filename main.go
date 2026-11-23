@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/color"
 	"image/jpeg"
 	"io"
 	"net/http"
@@ -55,9 +56,56 @@ func setCORSHeaders(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Max-Age", "86400") // 24 hours
 }
 
+// A small file can declare huge dimensions, so we size the decoded image from
+// its header first. The budget still fits a 200 MP 4:2:0 phone JPEG.
+const maxDecodedImageBytes = 400_000_000
+
+var errImageTooLarge = errors.New("image is too large to process")
+
+// Each decode can take the whole budget, so we run only a few at once.
+var imageDecodeSlots = make(chan struct{}, 2)
+
+func writeImageError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errImageTooLarge) {
+		http.Error(w, "Image is too large to process, resize it and try again", http.StatusRequestEntityTooLarge)
+		return
+	}
+	http.Error(w, "Failed to process image", http.StatusInternalServerError)
+}
+
+func decodedBytesPerPixel(m color.Model) int64 {
+	if _, ok := m.(color.Palette); ok {
+		return 1
+	}
+	switch m {
+	case color.GrayModel, color.AlphaModel:
+		return 1
+	case color.Gray16Model, color.Alpha16Model, color.YCbCrModel:
+		return 2
+	case color.RGBAModel, color.NRGBAModel, color.CMYKModel:
+		return 4
+	}
+	return 8
+}
+
+func checkDecodeBudget(data []byte) error {
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	if int64(cfg.Width)*int64(cfg.Height)*decodedBytesPerPixel(cfg.ColorModel) > maxDecodedImageBytes {
+		return errImageTooLarge
+	}
+	return nil
+}
+
 // processImage processes images based on configuration
 func processImage(data []byte, author string, jwtExpiry time.Time, serverExpiry time.Time, compressionEnabled bool, maxWidth, maxHeight, jpegQuality int, convertToJpeg bool) ([]byte, string, error) {
-	// Decode image
+	if err := checkDecodeBudget(data); err != nil {
+		return nil, "", err
+	}
+	imageDecodeSlots <- struct{}{}
+	defer func() { <-imageDecodeSlots }()
 	img, format, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
 		return nil, "", err
@@ -471,7 +519,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request, port string, deleteTi
 			imageCompressionEnabled, imageMaxWidth, imageMaxHeight,
 			imageJpegQuality, imageConvertToJpeg)
 		if err != nil {
-			http.Error(w, "Failed to process image", http.StatusInternalServerError)
+			writeImageError(w, err)
 			return
 		}
 		suffix, _ := randomHex(4)
@@ -534,6 +582,11 @@ func extFromMime(mime string) string {
 	return ".bin"
 }
 
+// We leave room for the multipart headers around the one image field.
+func avatarBodyLimit(maxUploadSize int64) int64 {
+	return maxUploadSize + 1<<20
+}
+
 func uploadUserAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploadSize int64, imageCompressionEnabled bool, imageMaxWidth, imageMaxHeight, imageJpegQuality int, imageConvertToJpeg bool) {
 	fmt.Println("uploadUserAvatarHandler called")
 	setCORSHeaders(w)
@@ -559,6 +612,7 @@ func uploadUserAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploadSi
 	}
 	author := nick + ":" + account
 
+	r.Body = http.MaxBytesReader(w, r.Body, avatarBodyLimit(maxUploadSize))
 	contentType := r.Header.Get("Content-Type")
 
 	if strings.Contains(contentType, "multipart/form-data") {
@@ -586,7 +640,7 @@ func uploadUserAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploadSi
 		// Process image (resize, strip EXIF, add custom EXIF)
 		processedData, format, err := processImage(data, author, time.Now().Add(365*24*time.Hour), time.Now().Add(365*24*time.Hour), imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
 		if err != nil {
-			http.Error(w, "Failed to process image", http.StatusInternalServerError)
+			writeImageError(w, err)
 			return
 		}
 
@@ -629,7 +683,7 @@ func uploadUserAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploadSi
 		// Process image (resize, strip EXIF, add custom EXIF)
 		processedData, format, err := processImage(body, author, time.Now().Add(365*24*time.Hour), time.Now().Add(365*24*time.Hour), imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
 		if err != nil {
-			http.Error(w, "Failed to process image", http.StatusInternalServerError)
+			writeImageError(w, err)
 			return
 		}
 
@@ -683,7 +737,7 @@ func uploadUserAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploadSi
 		// Process image (resize, strip EXIF, add custom EXIF)
 		processedData, format, err := processImage(data, author, time.Now().Add(365*24*time.Hour), time.Now().Add(365*24*time.Hour), imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
 		if err != nil {
-			http.Error(w, "Failed to process image", http.StatusInternalServerError)
+			writeImageError(w, err)
 			return
 		}
 
@@ -772,6 +826,7 @@ func uploadChannelAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploa
 	}
 	author := nick + ":" + account
 
+	r.Body = http.MaxBytesReader(w, r.Body, avatarBodyLimit(maxUploadSize))
 	contentType := r.Header.Get("Content-Type")
 
 	if strings.Contains(contentType, "multipart/form-data") {
@@ -799,7 +854,7 @@ func uploadChannelAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploa
 		// Process image (resize, strip EXIF, add custom EXIF)
 		processedData, format, err := processImage(data, author, time.Now().Add(365*24*time.Hour), time.Now().Add(365*24*time.Hour), imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
 		if err != nil {
-			http.Error(w, "Failed to process image", http.StatusInternalServerError)
+			writeImageError(w, err)
 			return
 		}
 
@@ -842,7 +897,7 @@ func uploadChannelAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploa
 		// Process image (resize, strip EXIF, add custom EXIF)
 		processedData, format, err := processImage(body, author, time.Now().Add(365*24*time.Hour), time.Now().Add(365*24*time.Hour), imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
 		if err != nil {
-			http.Error(w, "Failed to process image", http.StatusInternalServerError)
+			writeImageError(w, err)
 			return
 		}
 
@@ -896,7 +951,7 @@ func uploadChannelAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploa
 		// Process image (resize, strip EXIF, add custom EXIF)
 		processedData, format, err := processImage(data, author, time.Now().Add(365*24*time.Hour), time.Now().Add(365*24*time.Hour), imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
 		if err != nil {
-			http.Error(w, "Failed to process image", http.StatusInternalServerError)
+			writeImageError(w, err)
 			return
 		}
 

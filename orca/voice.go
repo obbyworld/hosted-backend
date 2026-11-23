@@ -384,6 +384,15 @@ func (vs *voiceSubsystem) handleUtterance(ctx context.Context, channel, speaker 
 // resolve "who's in #X?" / "what channels exist?" style asks.
 const voiceToolBudget = 3
 
+// We ask the server on every call, since a user can lose +o at any moment.
+func (o *Orca) isOper(ctx context.Context, nick string) bool {
+	u, err := newIRCTool(o.irc).UserGet(ctx, nick, 2)
+	if err != nil || u == nil {
+		return false
+	}
+	return strings.Contains(getString(u, "user", "modes"), "o")
+}
+
 // askPlain runs an /ask-shaped exchange with the same admin-tool access
 // /ask has, but with a smaller iteration budget so voice latency stays
 // reasonable. Memory is kept per voice channel via the same ConvKey,
@@ -416,8 +425,9 @@ func (vs *voiceSubsystem) askPlain(ctx context.Context, channel, speaker, query 
 		Content: query,
 	})
 
-	messages := vs.o.memory.BuildMessages(conv, sysPrompt, speakerNote, "")
-	tools := vs.o.aiTools()
+	oper := vs.o.isOper(ctx, speaker)
+	messages := vs.o.memory.BuildMessages(conv, oper, sysPrompt, speakerNote, "")
+	tools := vs.o.aiTools(oper)
 
 	var answer string
 	for iter := 0; iter < voiceToolBudget; iter++ {
@@ -453,7 +463,7 @@ func (vs *voiceSubsystem) askPlain(ctx context.Context, channel, speaker, query 
 				_ = json.Unmarshal([]byte(tc.Function.Arguments), &params)
 			}
 			// Voice path has no WorkflowEmitter; invokeAITool tolerates nil.
-			result, terr := vs.o.invokeAITool(ctx, tc.Function.Name, params, nil)
+			result, terr := vs.o.invokeAITool(ctx, oper, tc.Function.Name, params, nil)
 			if terr != nil {
 				result = fmt.Sprintf(`{"error":%q}`, terr.Error())
 			}

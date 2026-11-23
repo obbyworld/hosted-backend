@@ -26,6 +26,15 @@ var askCommand = bot.Command{
 	},
 }
 
+// The gateway whispers every /ask reply, so we keep each invoker's thread
+// apart from the channel's, keyed by account so a nick change cannot take it over.
+func askThreadKey(a bot.Author) ConvKey {
+	if a.Account != "" && a.Account != "*" {
+		return ConvKey{Private: "account:" + a.Account}
+	}
+	return ConvKey{Private: "nick:" + a.Nick}
+}
+
 func (o *Orca) cmdAsk(ctx context.Context, inv *bot.Invocation) error {
 	query := strings.TrimSpace(inv.String("query"))
 	if query == "" {
@@ -37,12 +46,7 @@ func (o *Orca) cmdAsk(ctx context.Context, inv *bot.Invocation) error {
 	// below if the model keeps calling tools.
 	_ = inv.Defer()
 
-	convKey := ConvKey{}
-	if inv.Channel != "" {
-		convKey.Channel = inv.Channel
-	} else {
-		convKey.PMNick = inv.Author.Nick
-	}
+	convKey := askThreadKey(inv.Author)
 
 	if inv.Bool("reset") {
 		o.memory.Reset(convKey)
@@ -76,9 +80,9 @@ func (o *Orca) cmdAsk(ctx context.Context, inv *bot.Invocation) error {
 	o.logger.AppendTurn(convKey, userTurn)
 
 	sysPrompt := o.buildSystemPrompt(ctx, inv, conv)
-	messages := o.memory.BuildMessages(conv, sysPrompt, speakerNote, "")
+	messages := o.memory.BuildMessages(conv, inv.Author.IsOper, sysPrompt, speakerNote, "")
 
-	tools := o.aiTools()
+	tools := o.aiTools(inv.Author.IsOper)
 
 	for iter := 0; iter < maxToolIterations; iter++ {
 		_ = inv.Defer()
@@ -128,7 +132,7 @@ func (o *Orca) cmdAsk(ctx context.Context, inv *bot.Invocation) error {
 			if tc.Function.Arguments != "" {
 				_ = json.Unmarshal([]byte(tc.Function.Arguments), &params)
 			}
-			result, terr := o.invokeAITool(ctx, tc.Function.Name, params, w)
+			result, terr := o.invokeAITool(ctx, inv.Author.IsOper, tc.Function.Name, params, w)
 			if terr != nil {
 				result = fmt.Sprintf(`{"error":%q}`, terr.Error())
 			}
@@ -155,11 +159,11 @@ func (o *Orca) cmdAsk(ctx context.Context, inv *bot.Invocation) error {
 	return inv.Whisper(fmt.Sprintf("ask: model exceeded tool-call budget (%d); thread kept, retry with /ask reset:true if needed.", maxToolIterations))
 }
 
-func (o *Orca) invokeAITool(ctx context.Context, name string, params map[string]any, w *bot.WorkflowEmitter) (string, error) {
+func (o *Orca) invokeAITool(ctx context.Context, oper bool, name string, params map[string]any, w *bot.WorkflowEmitter) (string, error) {
 	o.cmdMu.RLock()
 	t, ok := o.aiToolMap[name]
 	o.cmdMu.RUnlock()
-	if !ok {
+	if !ok || !oper {
 		return "", fmt.Errorf("unknown tool: %s", name)
 	}
 	return t.Handler(ctx, o, params, w)
